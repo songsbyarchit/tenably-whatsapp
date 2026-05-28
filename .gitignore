@@ -1,0 +1,8 @@
+.env
+credentials.json
+oauth_credentials.json
+token.json
+renter_preferences.json
+venv/
+__pycache__/
+*.pyc
