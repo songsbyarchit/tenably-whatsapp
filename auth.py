@@ -1,0 +1,16 @@
+"""
+Run this script once to authenticate with Google Calendar.
+It will open a browser, ask you to log in as archit.sachdeva007@gmail.com,
+and save the resulting token to token.json.
+"""
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+flow = InstalledAppFlow.from_client_secrets_file("oauth_credentials.json", SCOPES)
+creds = flow.run_local_server(port=0)
+
+with open("token.json", "w") as f:
+    f.write(creds.to_json())
+
+print("Authentication successful. token.json saved.")
