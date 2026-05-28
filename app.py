@@ -40,6 +40,15 @@ conversation_history: dict[str, list[dict]] = {}
 pending_viewings: dict[str, str] = {}
 _watch_channel_id: str | None = None
 
+# Senders that have already received the intro media files
+intro_media_sent: set[str] = set()
+
+INTRO_MEDIA = [
+    ("sample_payslip.pdf",       "application/pdf"),
+    ("sample_right_to_rent.pdf", "application/pdf"),
+    ("sample_passport.jpg",      "image/jpeg"),
+]
+
 # Tool definition for Claude
 TOOLS = [
     {
@@ -91,6 +100,20 @@ def load_preferences() -> dict:
         return {"day_start": "09:00", "day_end": "21:00", "blocked_slots": []}
 
 
+def send_intro_media(to: str) -> None:
+    """Send the three renter credential files as separate WhatsApp media messages."""
+    if not TWILIO_WHATSAPP_FROM or not WEBHOOK_BASE_URL:
+        return
+    to_wa = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
+    from_wa = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
+    for filename, _ in INTRO_MEDIA:
+        twilio_client.messages.create(
+            from_=from_wa,
+            to=to_wa,
+            media_url=[f"{WEBHOOK_BASE_URL}/media/{filename}"],
+        )
+
+
 def send_whatsapp(to: str, body: str) -> None:
     """Send an outbound WhatsApp message via Twilio."""
     if not TWILIO_WHATSAPP_FROM:
@@ -98,7 +121,7 @@ def send_whatsapp(to: str, body: str) -> None:
         return
     to_wa = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
     twilio_client.messages.create(
-        from_=f"whatsapp:{TWILIO_WHATSAPP_FROM}",
+        from_=TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}",
         to=to_wa,
         body=body,
     )
@@ -451,6 +474,18 @@ def handle_message(body: str, sender: str) -> str:
         history.append({"role": "user", "content": tool_results})
 
 
+@app.route("/media/<path:filename>")
+def serve_media(filename):
+    mime = next((m for f, m in INTRO_MEDIA if f == filename), "application/octet-stream")
+    return send_file(filename, mimetype=mime)
+
+
+@app.route("/googled9489acb4345354b.html")
+def google_site_verification():
+    with open("googled9489acb4345354b.html") as f:
+        return f.read(), 200, {"Content-Type": "text/html"}
+
+
 @app.route("/preferences")
 def preferences_page():
     return send_file("preferences.html")
@@ -508,10 +543,18 @@ def calendar_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    body = request.form.get("Body", "")
+    body   = request.form.get("Body", "")
     sender = request.form.get("From", "")
 
+    is_first = sender not in intro_media_sent
     reply = handle_message(body, sender)
+
+    if is_first:
+        try:
+            send_intro_media(sender)
+        except Exception as e:
+            app.logger.warning(f"Could not send intro media: {e}")
+        intro_media_sent.add(sender)
 
     response = MessagingResponse()
     response.message(reply)
