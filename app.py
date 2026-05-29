@@ -272,11 +272,16 @@ def is_valid_uk_location(loc: str) -> bool:
 
 
 def get_calendar_service():
-    creds = Credentials.from_authorized_user_file("token.json")
+    token_json = os.environ.get("GOOGLE_TOKEN_JSON")
+    if token_json:
+        creds = Credentials.from_authorized_user_info(json.loads(token_json))
+    else:
+        creds = Credentials.from_authorized_user_file("token.json")
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        with open("token.json", "w") as f:
-            f.write(creds.to_json())
+        if not token_json:
+            with open("token.json", "w") as f:
+                f.write(creds.to_json())
     return build("calendar", "v3", credentials=creds)
 
 
@@ -752,4 +757,4 @@ def webhook():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
