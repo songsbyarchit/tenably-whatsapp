@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import uuid
 import time as time_module
@@ -215,6 +216,7 @@ def get_commute_minutes(origin: str, destination: str, departure_time: datetime)
     if not origin or not destination:
         app.logger.warning(f"get_commute_minutes: missing origin={origin!r} or destination={destination!r}")
         return 0
+    data = None
     try:
         resp = http_requests.get(
             "https://maps.googleapis.com/maps/api/distancematrix/json",
@@ -228,15 +230,45 @@ def get_commute_minutes(origin: str, destination: str, departure_time: datetime)
             timeout=5,
         )
         data = resp.json()
-        element = data["rows"][0]["elements"][0]
+        top_status = data.get("status")
+        if top_status != "OK":
+            app.logger.warning(f"Distance Matrix top-level status={top_status!r} | full response: {data}")
+            return 0
+        rows = data.get("rows", [])
+        if not rows or not rows[0].get("elements"):
+            app.logger.warning(f"Distance Matrix empty rows/elements | full response: {data}")
+            return 0
+        element = rows[0]["elements"][0]
         if element["status"] == "OK":
             minutes = element["duration"]["value"] // 60
             app.logger.info(f"Commute | {origin!r} → {destination!r} @ {departure_time.strftime('%-I:%M %p')} = {minutes} mins")
             return minutes
-        app.logger.warning(f"Distance Matrix non-OK status={element['status']} | {origin!r} → {destination!r}")
+        app.logger.warning(f"Distance Matrix element status={element['status']!r} | {origin!r} → {destination!r} | full response: {data}")
     except Exception as e:
-        app.logger.warning(f"Distance Matrix API error: {e} | {origin!r} → {destination!r}")
+        app.logger.warning(f"Distance Matrix API error: {e} | {origin!r} → {destination!r} | response: {data}")
     return 0
+
+
+_UK_POSTCODE_RE = re.compile(
+    r"\b[A-Z]{1,2}[0-9][0-9A-Z]?\s?[0-9][A-Z]{2}\b", re.IGNORECASE
+)
+_UK_KEYWORDS = (
+    "uk", "united kingdom", "england", "scotland", "wales",
+    "london", "manchester", "birmingham", "leeds", "bristol",
+    "edinburgh", "glasgow", "liverpool", "sheffield", "oxford",
+    "cambridge", "nottingham", "leicester", "coventry", "newcastle",
+)
+
+def is_valid_uk_location(loc: str) -> bool:
+    """Return True if loc looks like a real UK address suitable for routing."""
+    if not loc or not loc.strip():
+        return False
+    lower = loc.lower()
+    if any(kw in lower for kw in _UK_KEYWORDS):
+        return True
+    if _UK_POSTCODE_RE.search(loc):
+        return True
+    return False
 
 
 def get_calendar_service():
@@ -271,7 +303,10 @@ def get_free_slots() -> str:
     for event in events_result.get("items", []):
         start = event["start"].get("dateTime") or event["start"].get("date")
         end = event["end"].get("dateTime") or event["end"].get("date")
-        location = event.get("location", "")
+        raw_location = event.get("location", "")
+        location = raw_location if is_valid_uk_location(raw_location) else ""
+        if raw_location and not location:
+            app.logger.info(f"get_free_slots: ignoring non-UK/invalid location {raw_location!r} — falling back to home")
         try:
             busy.append((
                 datetime.fromisoformat(start).astimezone(TIMEZONE),
@@ -419,9 +454,12 @@ def check_slot_availability(start_iso: str) -> str:
 
     busy: list[tuple[datetime, datetime, str]] = []  # (start, end, location)
     for event in events_result.get("items", []):
-        start    = event["start"].get("dateTime") or event["start"].get("date")
-        end      = event["end"].get("dateTime") or event["end"].get("date")
-        location = event.get("location", "")
+        start        = event["start"].get("dateTime") or event["start"].get("date")
+        end          = event["end"].get("dateTime") or event["end"].get("date")
+        raw_location = event.get("location", "")
+        location     = raw_location if is_valid_uk_location(raw_location) else ""
+        if raw_location and not location:
+            app.logger.info(f"check_slot_availability: ignoring non-UK/invalid location {raw_location!r} — falling back to home")
         try:
             busy.append((
                 datetime.fromisoformat(start).astimezone(TIMEZONE),
@@ -683,6 +721,12 @@ def webhook():
     sender = request.form.get("From", "")
 
     app.logger.info(f"Incoming message | from={sender} | body={body!r}")
+
+    if body.strip().lower() == "reset":
+        conversation_history.pop(sender, None)
+        intro_media_sent.discard(sender)
+        send_whatsapp(sender, "Ready. Send a message to start fresh.")
+        return ("", 200)
 
     is_first = sender not in intro_media_sent
 
