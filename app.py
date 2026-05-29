@@ -1,10 +1,10 @@
 import os
 import json
 import uuid
+import time as time_module
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from flask import Flask, request, send_file, jsonify
-from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
 from dotenv import load_dotenv
 import anthropic
@@ -32,22 +32,26 @@ GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
 PREFS_FILE = "renter_preferences.json"
+RENTER_NAME  = os.environ.get("RENTER_NAME",  "the renter")
+RENTER_AREA  = os.environ.get("RENTER_AREA",  "")
+RENTER_PHONE = os.environ.get("RENTER_PHONE", "")
 
 # In-memory conversation history keyed by sender phone number
 conversation_history: dict[str, list[dict]] = {}
 
 # Pending viewings awaiting renter acceptance: event_id -> landlord phone
 pending_viewings: dict[str, str] = {}
+confirmed_viewings: set[str] = set()
 _watch_channel_id: str | None = None
 
 # Senders that have already received the intro media files
 intro_media_sent: set[str] = set()
 
-INTRO_MEDIA = [
-    ("sample_payslip.pdf",       "application/pdf"),
-    ("sample_right_to_rent.pdf", "application/pdf"),
-    ("sample_passport.jpg",      "image/jpeg"),
-]
+DOCUMENT_MAP = {
+    "payslip":       ("sample_payslip.pdf",       "application/pdf"),
+    "right_to_rent": ("sample_right_to_rent.pdf", "application/pdf"),
+    "passport":      ("sample_passport.jpg",       "image/jpeg"),
+}
 
 # Tool definition for Claude
 TOOLS = [
@@ -66,6 +70,29 @@ TOOLS = [
                 },
             },
             "required": ["start_iso"],
+        },
+    },
+    {
+        "name": "send_documents",
+        "description": (
+            "Send renter documents to the landlord via WhatsApp media messages. "
+            "Call this whenever the landlord asks to see any documents. "
+            "Infer which documents they want — 'payslip', 'right_to_rent', 'passport'. "
+            "Send all three for broad requests like 'send all docs' or 'send everything'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "documents": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["payslip", "right_to_rent", "passport"],
+                    },
+                    "description": "List of documents to send.",
+                },
+            },
+            "required": ["documents"],
         },
     },
     {
@@ -100,18 +127,50 @@ def load_preferences() -> dict:
         return {"day_start": "09:00", "day_end": "21:00", "blocked_slots": []}
 
 
-def send_intro_media(to: str) -> None:
-    """Send the three renter credential files as separate WhatsApp media messages."""
+def load_property_address() -> str:
+    try:
+        with open("property.json") as f:
+            return json.load(f).get("address", "")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return VIEWING_PROPERTY_ADDRESS
+
+
+def send_documents(doc_names: list[str], to: str) -> str:
+    """Send requested renter documents as WhatsApp media messages."""
     if not TWILIO_WHATSAPP_FROM or not WEBHOOK_BASE_URL:
-        return
-    to_wa = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
+        return "Cannot send documents — server config missing."
+    to_wa   = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
     from_wa = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
-    for filename, _ in INTRO_MEDIA:
-        twilio_client.messages.create(
-            from_=from_wa,
-            to=to_wa,
-            media_url=[f"{WEBHOOK_BASE_URL}/media/{filename}"],
-        )
+    sent = []
+    for name in doc_names:
+        entry = DOCUMENT_MAP.get(name)
+        if entry:
+            filename, _ = entry
+            twilio_client.messages.create(
+                from_=from_wa,
+                to=to_wa,
+                media_url=[f"{WEBHOOK_BASE_URL}/media/{filename}"],
+            )
+            sent.append(name)
+    return f"Sent: {', '.join(sent)}." if sent else "No valid documents specified."
+
+
+def send_intro_messages(to: str) -> None:
+    """Send five ordered intro texts before any other message."""
+    name  = os.environ.get("RENTER_NAME", "the renter")
+    area  = os.environ.get("RENTER_AREA", "")
+    phone = os.environ.get("RENTER_PHONE", "")
+    messages = [
+        "Hi I'm an AI assistant from Tenably helping landlords and renters arrange viewings",
+        f"I'm reaching out on behalf of {name}",
+        f"{name} currently lives in {area} and is interested in your property",
+        f"If you'd prefer to speak directly you can call or text them at {phone}",
+        f"I already have {name}'s payslip right to rent and passport — just ask if you'd like any of them",
+    ]
+    for i, msg in enumerate(messages):
+        if i > 0:
+            time_module.sleep(1)
+        send_whatsapp(to, msg)
 
 
 def send_whatsapp(to: str, body: str) -> None:
@@ -123,7 +182,7 @@ def send_whatsapp(to: str, body: str) -> None:
     twilio_client.messages.create(
         from_=TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}",
         to=to_wa,
-        body=body,
+        body=body.replace("\n", " ").strip(),
     )
 
 
@@ -150,7 +209,11 @@ def setup_calendar_watch() -> None:
 def get_commute_minutes(origin: str, destination: str, departure_time: datetime) -> int:
     """Return travel time in minutes between two locations using Google Maps Distance Matrix API.
     Falls back to 0 if the API key is missing or the request fails."""
-    if not GOOGLE_MAPS_API_KEY or not origin or not destination:
+    if not GOOGLE_MAPS_API_KEY:
+        app.logger.warning("GOOGLE_MAPS_API_KEY not set — commute check skipped, assuming 0 mins")
+        return 0
+    if not origin or not destination:
+        app.logger.warning(f"get_commute_minutes: missing origin={origin!r} or destination={destination!r}")
         return 0
     try:
         resp = http_requests.get(
@@ -167,9 +230,12 @@ def get_commute_minutes(origin: str, destination: str, departure_time: datetime)
         data = resp.json()
         element = data["rows"][0]["elements"][0]
         if element["status"] == "OK":
-            return element["duration"]["value"] // 60
-    except Exception:
-        pass
+            minutes = element["duration"]["value"] // 60
+            app.logger.info(f"Commute | {origin!r} → {destination!r} @ {departure_time.strftime('%-I:%M %p')} = {minutes} mins")
+            return minutes
+        app.logger.warning(f"Distance Matrix non-OK status={element['status']} | {origin!r} → {destination!r}")
+    except Exception as e:
+        app.logger.warning(f"Distance Matrix API error: {e} | {origin!r} → {destination!r}")
     return 0
 
 
@@ -244,6 +310,10 @@ def get_free_slots() -> str:
         earliest = min(following, key=lambda e: e[0])
         return earliest[0], earliest[2] or RENTER_HOME_LOCATION
 
+    property_address = load_property_address()
+    if not property_address:
+        app.logger.warning("get_free_slots: no property address found — commute checks will be skipped")
+
     free_slots: list[str] = []
     for day_offset in range(7):
         day = (now + timedelta(days=day_offset)).date()
@@ -252,6 +322,8 @@ def get_free_slots() -> str:
 
         while slot_start + timedelta(hours=SLOT_DURATION_HOURS) <= day_end_dt:
             slot_end = slot_start + timedelta(hours=SLOT_DURATION_HOURS)
+            slot_label = slot_start.strftime("%-d %b %-I:%M %p")
+
             if slot_end <= now:
                 slot_start = slot_end
                 continue
@@ -261,30 +333,51 @@ def get_free_slots() -> str:
                 for b_start, b_end, _ in busy
             )
 
-            if is_free and VIEWING_PROPERTY_ADDRESS:
-                # Check inbound commute: can renter arrive from preceding event in time?
+            if not is_free:
+                app.logger.info(f"Slot {slot_label} | BUSY (calendar clash)")
+                slot_start = slot_end
+                continue
+
+            if property_address:
+                # Inbound: can renter arrive from preceding event in time?
                 event_end_time, origin = preceding_event(slot_start)
-                inbound_minutes = get_commute_minutes(origin, VIEWING_PROPERTY_ADDRESS, event_end_time)
-                if event_end_time + timedelta(minutes=inbound_minutes) > slot_start:
+                inbound_minutes = get_commute_minutes(origin, property_address, event_end_time)
+                latest_departure = event_end_time + timedelta(minutes=inbound_minutes)
+                app.logger.info(
+                    f"Slot {slot_label} | inbound: origin={origin!r} departs={event_end_time.strftime('%-I:%M %p')} "
+                    f"commute={inbound_minutes}m arrives={latest_departure.strftime('%-I:%M %p')} "
+                    f"slot_start={slot_start.strftime('%-I:%M %p')}"
+                )
+                if latest_departure > slot_start:
+                    app.logger.info(f"Slot {slot_label} | REJECTED — inbound commute clash ({inbound_minutes} mins, arrives too late)")
                     slot_start = slot_end
                     continue
 
-                # Check outbound commute: can renter reach the next event from the viewing in time?
-                next_event = following_event(slot_end)
-                if next_event:
-                    next_start, next_location = next_event
-                    outbound_minutes = get_commute_minutes(VIEWING_PROPERTY_ADDRESS, next_location, slot_end)
-                    if slot_end + timedelta(minutes=outbound_minutes) > next_start:
+                # Outbound: can renter reach the next event from the viewing in time?
+                next_ev = following_event(slot_end)
+                if next_ev:
+                    next_start, next_location = next_ev
+                    outbound_minutes = get_commute_minutes(property_address, next_location, slot_end)
+                    earliest_arrival = slot_end + timedelta(minutes=outbound_minutes)
+                    app.logger.info(
+                        f"Slot {slot_label} | outbound: dest={next_location!r} departs={slot_end.strftime('%-I:%M %p')} "
+                        f"commute={outbound_minutes}m arrives={earliest_arrival.strftime('%-I:%M %p')} "
+                        f"next_event={next_start.strftime('%-I:%M %p')}"
+                    )
+                    if earliest_arrival > next_start:
+                        app.logger.info(f"Slot {slot_label} | REJECTED — outbound commute clash ({outbound_minutes} mins, can't reach next event)")
                         slot_start = slot_end
                         continue
+                else:
+                    app.logger.info(f"Slot {slot_label} | outbound: no following event — outbound check skipped")
 
-            if is_free:
-                free_slots.append(
-                    slot_start.strftime("%-d %b (%a) %-I:%M %p")
-                    + " – "
-                    + slot_end.strftime("%-I:%M %p")
-                    + f" | ISO: {slot_start.strftime('%Y-%m-%dT%H:%M:%S')} / {slot_end.strftime('%Y-%m-%dT%H:%M:%S')}"
-                )
+            app.logger.info(f"Slot {slot_label} | AVAILABLE")
+            free_slots.append(
+                slot_start.strftime("%-d %b (%a) %-I:%M %p")
+                + " – "
+                + slot_end.strftime("%-I:%M %p")
+                + f" | ISO: {slot_start.strftime('%Y-%m-%dT%H:%M:%S')} / {slot_end.strftime('%Y-%m-%dT%H:%M:%S')}"
+            )
             slot_start = slot_end
 
     if not free_slots:
@@ -293,14 +386,15 @@ def get_free_slots() -> str:
 
 
 def check_slot_availability(start_iso: str) -> str:
-    """Check if a 30-minute slot is free; if not, return the nearest free slot."""
+    """Check if a 30-minute slot is free and commute-feasible; suggest nearest valid slot if not."""
     prefs = load_preferences()
-    day_start = time.fromisoformat(prefs.get("day_start", "09:00"))
-    day_end   = time.fromisoformat(prefs.get("day_end",   "21:00"))
+    day_start        = time.fromisoformat(prefs.get("day_start", "09:00"))
+    day_end          = time.fromisoformat(prefs.get("day_end",   "21:00"))
+    property_address = load_property_address()
 
-    service = get_calendar_service()
+    service    = get_calendar_service()
     slot_start = datetime.fromisoformat(start_iso).replace(tzinfo=TIMEZONE)
-    slot_end = slot_start + timedelta(hours=SLOT_DURATION_HOURS)
+    slot_end   = slot_start + timedelta(hours=SLOT_DURATION_HOURS)
 
     now = datetime.now(tz=TIMEZONE)
     if slot_start < now:
@@ -323,19 +417,20 @@ def check_slot_availability(start_iso: str) -> str:
         orderBy="startTime",
     ).execute()
 
-    busy: list[tuple[datetime, datetime]] = []
+    busy: list[tuple[datetime, datetime, str]] = []  # (start, end, location)
     for event in events_result.get("items", []):
-        start = event["start"].get("dateTime") or event["start"].get("date")
-        end = event["end"].get("dateTime") or event["end"].get("date")
+        start    = event["start"].get("dateTime") or event["start"].get("date")
+        end      = event["end"].get("dateTime") or event["end"].get("date")
+        location = event.get("location", "")
         try:
             busy.append((
                 datetime.fromisoformat(start).astimezone(TIMEZONE),
                 datetime.fromisoformat(end).astimezone(TIMEZONE),
+                location,
             ))
         except ValueError:
             continue
 
-    # Expand recurring blocked slots into the search window
     for day_offset in range(8):
         d = (now + timedelta(days=day_offset)).date()
         for bs in prefs.get("blocked_slots", []):
@@ -343,29 +438,62 @@ def check_slot_availability(start_iso: str) -> str:
                 busy.append((
                     datetime.combine(d, time.fromisoformat(bs["start"]), tzinfo=TIMEZONE),
                     datetime.combine(d, time.fromisoformat(bs["end"]),   tzinfo=TIMEZONE),
+                    "",
                 ))
             except (KeyError, ValueError):
                 continue
 
-    def is_slot_free(s: datetime) -> bool:
-        e = s + timedelta(hours=SLOT_DURATION_HOURS)
-        return all(e <= b_start or s >= b_end for b_start, b_end in busy)
+    def preceding_loc(s: datetime) -> tuple[datetime, str]:
+        pre = [e for e in busy if e[1] <= s]
+        if not pre:
+            return s, RENTER_HOME_LOCATION
+        latest = max(pre, key=lambda e: e[1])
+        return latest[1], latest[2] or RENTER_HOME_LOCATION
 
-    if is_slot_free(slot_start):
+    def following_loc(e: datetime) -> tuple[datetime, str] | None:
+        fol = [ev for ev in busy if ev[0] >= e]
+        if not fol:
+            return None
+        earliest = min(fol, key=lambda ev: ev[0])
+        return earliest[0], earliest[2] or RENTER_HOME_LOCATION
+
+    def is_calendar_free(s: datetime) -> bool:
+        e = s + timedelta(hours=SLOT_DURATION_HOURS)
+        return all(e <= b_start or s >= b_end for b_start, b_end, _ in busy)
+
+    def is_commute_ok(s: datetime) -> bool:
+        if not property_address:
+            return True
+        e = s + timedelta(hours=SLOT_DURATION_HOURS)
+        ev_end, origin = preceding_loc(s)
+        if ev_end + timedelta(minutes=get_commute_minutes(origin, property_address, ev_end)) > s:
+            return False
+        nxt = following_loc(e)
+        if nxt:
+            nxt_start, nxt_loc = nxt
+            if e + timedelta(minutes=get_commute_minutes(property_address, nxt_loc, e)) > nxt_start:
+                return False
+        return True
+
+    def fmt(s: datetime) -> str:
+        return s.strftime("%-I:%M %p")
+
+    if is_calendar_free(slot_start) and is_commute_ok(slot_start):
         return (
-            f"Free. start_iso={slot_start.strftime('%Y-%m-%dT%H:%M:%S')} "
+            f"Free. {fmt(slot_start)} to {fmt(slot_end)}. "
+            f"start_iso={slot_start.strftime('%Y-%m-%dT%H:%M:%S')} "
             f"end_iso={slot_end.strftime('%Y-%m-%dT%H:%M:%S')}"
         )
 
-    # Find nearest free slot within the 7-day window
+    # Find nearest slot that is both calendar-free and commute-feasible
     candidate = datetime.combine(now.date(), day_start, tzinfo=TIMEZONE)
     while candidate + timedelta(hours=SLOT_DURATION_HOURS) <= window_end:
         c_end = candidate + timedelta(hours=SLOT_DURATION_HOURS)
         if c_end > now and candidate.time() >= day_start and c_end.time() <= day_end:
-            if is_slot_free(candidate):
+            if is_calendar_free(candidate) and is_commute_ok(candidate):
                 return (
-                    f"Busy. Nearest free slot: {candidate.strftime('%-d %b (%a) %-I:%M %p')} – "
-                    f"{c_end.strftime('%-I:%M %p')} | "
+                    f"Busy. Nearest free slot: {candidate.strftime('%-d %b (%a)')} "
+                    f"{fmt(candidate)} to {fmt(c_end)} | "
                     f"start_iso={candidate.strftime('%Y-%m-%dT%H:%M:%S')} "
                     f"end_iso={c_end.strftime('%Y-%m-%dT%H:%M:%S')}"
                 )
@@ -385,11 +513,12 @@ def create_viewing_event(start_iso: str, end_iso: str, landlord_phone: str) -> s
 
     start_dt = datetime.fromisoformat(start_iso).replace(tzinfo=TIMEZONE)
     friendly = start_dt.strftime("%-d %B %Y at %-I:%M %p")
-    property_line = f"\nProperty: {VIEWING_PROPERTY_ADDRESS}" if VIEWING_PROPERTY_ADDRESS else ""
+    property_address = load_property_address()
+    property_line = f"\nProperty: {property_address}" if property_address else ""
 
     event = {
         "summary": "Property Viewing",
-        "description": f"Viewing arranged via Tenably\nDate/Time: {friendly}{property_line}\n\nPlease accept or decline this invite.",
+        "description": f"Viewing arranged via Tenably\nDate/Time: {friendly}{property_line}\n\nPlease accept or decline this invite.\n\nPlease reply Yes to this invite as soon as you know you're free — your Tenably agent is waiting to confirm with the landlord",
         "start": {"dateTime": start_iso, "timeZone": tz_str},
         "end": {"dateTime": end_iso, "timeZone": tz_str},
         "status": "tentative",
@@ -422,6 +551,8 @@ Rules:
 - Max 20 words per reply. Casual, warm, human tone. No paragraphs, no bullet lists.
 - No emojis. Minimal punctuation. No commas unless absolutely necessary. Exclamation marks only occasionally at the end of a sentence.
 - Only propose times from the available slots below. If the landlord suggests another time, call check_slot_availability first — if it's free confirm it, if not suggest the nearest free slot returned by the tool.
+- When proposing or confirming any time always state the exact start and end time in the format "Xpm to Ypm" e.g. "6:30pm to 7:00pm". Never mention just a start time without the end time.
+- If the landlord asks for any documents, call send_documents with the relevant names from: payslip, right_to_rent, passport. For broad requests like "all docs" or "everything" send all three. After sending, reply confirming which were sent.
 - When a time is agreed and confirmed free, call create_viewing_event, then reply to the landlord with exactly: triple checking with renter
 
 Renter's available slots (ISO times included for tool use):
@@ -459,6 +590,8 @@ def handle_message(body: str, sender: str) -> str:
                 continue
             if block.name == "check_slot_availability":
                 result = check_slot_availability(block.input["start_iso"])
+            elif block.name == "send_documents":
+                result = send_documents(block.input["documents"], sender)
             elif block.name == "create_viewing_event":
                 result = create_viewing_event(
                     block.input["start_iso"], block.input["end_iso"], sender
@@ -476,7 +609,7 @@ def handle_message(body: str, sender: str) -> str:
 
 @app.route("/media/<path:filename>")
 def serve_media(filename):
-    mime = next((m for f, m in INTRO_MEDIA if f == filename), "application/octet-stream")
+    mime = next((m for _, (f, m) in DOCUMENT_MAP.items() if f == filename), "application/octet-stream")
     return send_file(filename, mimetype=mime)
 
 
@@ -516,6 +649,8 @@ def calendar_webhook():
     try:
         service = get_calendar_service()
         for event_id, landlord_phone in list(pending_viewings.items()):
+            if event_id in confirmed_viewings:
+                continue
             event = service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
             for attendee in event.get("attendees", []):
                 if attendee["email"] == RENTER_EMAIL and attendee.get("responseStatus") == "accepted":
@@ -525,6 +660,7 @@ def calendar_webhook():
                         friendly = start_dt.strftime("%-d %B at %-I:%M %p")
                     else:
                         friendly = "the agreed time"
+                    confirmed_viewings.add(event_id)
                     send_whatsapp(landlord_phone, f"Confirmed. Renter accepted the viewing on {friendly}")
                     del pending_viewings[event_id]
                     # Update event status to confirmed
@@ -546,19 +682,29 @@ def webhook():
     body   = request.form.get("Body", "")
     sender = request.form.get("From", "")
 
+    app.logger.info(f"Incoming message | from={sender} | body={body!r}")
+
     is_first = sender not in intro_media_sent
-    reply = handle_message(body, sender)
+
+    # Compute the bot reply before sending anything so all outbound messages
+    # are dispatched in the guaranteed order: intro texts → media → bot reply.
+    try:
+        reply = handle_message(body, sender)
+    except Exception as e:
+        app.logger.error(f"handle_message error: {e}", exc_info=True)
+        return ("", 200)
+
+    app.logger.info(f"Outgoing reply | to={sender} | body={reply!r}")
 
     if is_first:
-        try:
-            send_intro_media(sender)
-        except Exception as e:
-            app.logger.warning(f"Could not send intro media: {e}")
         intro_media_sent.add(sender)
+        try:
+            send_intro_messages(sender)
+        except Exception as e:
+            app.logger.warning(f"Could not send intro messages: {e}")
 
-    response = MessagingResponse()
-    response.message(reply)
-    return str(response)
+    send_whatsapp(sender, reply)
+    return ("", 200)
 
 
 if __name__ == "__main__":
