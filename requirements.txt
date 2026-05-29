@@ -1,0 +1,8 @@
+flask
+twilio
+python-dotenv
+anthropic
+requests
+google-auth
+google-auth-httplib2
+google-api-python-client
