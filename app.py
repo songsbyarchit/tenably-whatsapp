@@ -3,6 +3,7 @@ import re
 import json
 import uuid
 import time as time_module
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from flask import Flask, request, send_file, jsonify
@@ -49,9 +50,9 @@ _watch_channel_id: str | None = None
 intro_media_sent: set[str] = set()
 
 DOCUMENT_MAP = {
-    "payslip":       ("sample_payslip.pdf",       "application/pdf"),
-    "right_to_rent": ("sample_right_to_rent.pdf", "application/pdf"),
-    "passport":      ("sample_passport.jpg",       "image/jpeg"),
+    "payslip":       os.environ.get("PAYSLIP_URL", ""),
+    "right_to_rent": os.environ.get("RIGHT_TO_RENT_URL", ""),
+    "passport":      os.environ.get("PASSPORT_URL", ""),
 }
 
 # Tool definition for Claude
@@ -138,21 +139,18 @@ def load_property_address() -> str:
 
 def send_documents(doc_names: list[str], to: str) -> str:
     """Send requested renter documents as WhatsApp media messages."""
-    if not TWILIO_WHATSAPP_FROM or not WEBHOOK_BASE_URL:
-        return "Cannot send documents — server config missing."
+    if not TWILIO_WHATSAPP_FROM:
+        return "Cannot send documents — TWILIO_WHATSAPP_FROM not set."
     to_wa   = to if to.startswith("whatsapp:") else f"whatsapp:{to}"
     from_wa = TWILIO_WHATSAPP_FROM if TWILIO_WHATSAPP_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_WHATSAPP_FROM}"
     sent = []
     for name in doc_names:
-        entry = DOCUMENT_MAP.get(name)
-        if entry:
-            filename, _ = entry
-            twilio_client.messages.create(
-                from_=from_wa,
-                to=to_wa,
-                media_url=[f"{WEBHOOK_BASE_URL}/media/{filename}"],
-            )
-            sent.append(name)
+        url = DOCUMENT_MAP.get(name)
+        if not url:
+            app.logger.warning(f"send_documents: no URL configured for {name!r} — set {name.upper()}_URL env var")
+            continue
+        twilio_client.messages.create(from_=from_wa, to=to_wa, media_url=[url])
+        sent.append(name)
     return f"Sent: {', '.join(sent)}." if sent else "No valid documents specified."
 
 
@@ -580,23 +578,34 @@ def create_viewing_event(start_iso: str, end_iso: str, landlord_phone: str) -> s
         except Exception as e:
             app.logger.warning(f"Could not set up calendar watch: {e}")
 
-    return "Invite sent to renter. Reply to the landlord with exactly: triple checking with renter"
+    end_dt = datetime.fromisoformat(end_iso).replace(tzinfo=TIMEZONE)
+    cal_link = "https://calendar.google.com/calendar/render?" + urlencode({
+        "action": "TEMPLATE",
+        "text": "Property Viewing",
+        "dates": start_dt.strftime("%Y%m%dT%H%M%S") + "/" + end_dt.strftime("%Y%m%dT%H%M%S"),
+        "details": f"Viewing arranged via Tenably{property_line}",
+    })
+    send_whatsapp(landlord_phone, f"Add to your calendar: {cal_link}")
+
+    return f"Invite sent to renter. Reply to the landlord with exactly: Just confirming with {RENTER_NAME} now — will get back to you shortly"
 
 
 def build_system_prompt() -> str:
     available_slots = get_free_slots()
     now_str = datetime.now(tz=TIMEZONE).strftime("%A %-d %B %Y, %-I:%M %p %Z")
-    return f"""You are a WhatsApp assistant for Tenably arranging a property viewing on behalf of the renter.
+    return f"""You are a WhatsApp assistant for Tenably arranging a property viewing on behalf of {RENTER_NAME}.
 
 Current date and time: {now_str}
 
 Rules:
+- Write in British English at all times.
 - Max 20 words per reply. Casual, warm, human tone. No paragraphs, no bullet lists.
 - No emojis. Minimal punctuation. No commas unless absolutely necessary. Exclamation marks only occasionally at the end of a sentence.
+- Never say "we". Always refer to the renter by name. Say "{RENTER_NAME} is free at..." not "we have availability".
 - Only propose times from the available slots below. If the landlord suggests another time, call check_slot_availability first — if it's free confirm it, if not suggest the nearest free slot returned by the tool.
 - When proposing or confirming any time always state the exact start and end time in the format "Xpm to Ypm" e.g. "6:30pm to 7:00pm". Never mention just a start time without the end time.
 - If the landlord asks for any documents, call send_documents with the relevant names from: payslip, right_to_rent, passport. For broad requests like "all docs" or "everything" send all three. After sending, reply confirming which were sent.
-- When a time is agreed and confirmed free, call create_viewing_event, then reply to the landlord with exactly: triple checking with renter
+- When a time is agreed and confirmed free, call create_viewing_event, then reply to the landlord with exactly: Just confirming with {RENTER_NAME} now — will get back to you shortly
 
 Renter's available slots (ISO times included for tool use):
 {available_slots}"""
@@ -648,13 +657,6 @@ def handle_message(body: str, sender: str) -> str:
             })
 
         history.append({"role": "user", "content": tool_results})
-
-
-@app.route("/media/<path:filename>")
-def serve_media(filename):
-    mime = next((m for _, (f, m) in DOCUMENT_MAP.items() if f == filename), "application/octet-stream")
-    return send_file(filename, mimetype=mime)
-
 
 @app.route("/googled9489acb4345354b.html")
 def google_site_verification():
