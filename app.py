@@ -604,7 +604,8 @@ def create_viewing_event(start_iso: str, end_iso: str, landlord_phone: str) -> s
     })
     send_whatsapp(landlord_phone, f"Add to your calendar: {cal_link}")
 
-    return f"Invite sent to renter. Reply to the landlord with exactly: Just confirming with {RENTER_NAME} now — will get back to you shortly"
+    renter_first = RENTER_NAME.split()[0]
+    return f"Invite sent to renter. Reply to the landlord with exactly: Just confirming with {renter_first} now — will get back to you shortly"
 
 
 def build_system_prompt() -> str:
@@ -619,11 +620,11 @@ Rules:
 - Write in British English at all times.
 - Max 20 words per reply. Casual, warm, human tone. No paragraphs, no bullet lists.
 - No emojis. Minimal punctuation. No commas unless absolutely necessary. Exclamation marks only occasionally at the end of a sentence.
-- Never say "we". Refer to the renter by first name only: {renter_first}. Say "{renter_first} is free at..." not "we have availability". Only use the full name {RENTER_NAME} when first introducing them.
+- Never say "we". Always use first name only: {renter_first}. Say "{renter_first} is free at..." not "we have availability". Never use the full name.
 - Only propose times from the available slots below. If the landlord suggests another time, call check_slot_availability first — if it's free confirm it, if not suggest the nearest free slot returned by the tool.
 - When proposing or confirming any time always state the exact start and end time in the format "Xpm to Ypm" e.g. "6:30pm to 7:00pm". Never mention just a start time without the end time.
 - If the landlord asks for any documents, call send_documents with the relevant names from: payslip, right_to_rent, passport. For broad requests like "all docs" or "everything" send all three. After sending, reply confirming which were sent.
-- When a time is agreed and confirmed free, call create_viewing_event, then reply to the landlord with exactly: Just confirming with {RENTER_NAME} now — will get back to you shortly
+- When a time is agreed and confirmed free, call create_viewing_event, then reply to the landlord with exactly: Just confirming with {renter_first} now — will get back to you shortly
 
 Renter's available slots (ISO times included for tool use):
 {available_slots}"""
