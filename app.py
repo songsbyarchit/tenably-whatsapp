@@ -319,19 +319,21 @@ def get_free_slots() -> str:
         orderBy="startTime",
     ).execute()
 
-    busy: list[tuple[datetime, datetime, str]] = []  # (start, end, location)
+    busy: list[tuple[datetime, datetime, str, str]] = []  # (start, end, location, name)
     for event in events_result.get("items", []):
         start = event["start"].get("dateTime") or event["start"].get("date")
         end = event["end"].get("dateTime") or event["end"].get("date")
         raw_location = event.get("location", "")
         location = raw_location if is_valid_uk_location(raw_location) else ""
+        name = event.get("summary", "(unnamed event)")
         if raw_location and not location:
-            app.logger.info(f"get_free_slots: ignoring non-UK/invalid location {raw_location!r} — falling back to home")
+            app.logger.info(f"get_free_slots: ignoring non-UK/invalid location {raw_location!r} for event {name!r} — falling back to home")
         try:
             busy.append((
                 datetime.fromisoformat(start).astimezone(TIMEZONE),
                 datetime.fromisoformat(end).astimezone(TIMEZONE),
                 location,
+                name,
             ))
         except ValueError:
             continue
@@ -345,25 +347,26 @@ def get_free_slots() -> str:
                     datetime.combine(d, time.fromisoformat(bs["start"]), tzinfo=TIMEZONE),
                     datetime.combine(d, time.fromisoformat(bs["end"]),   tzinfo=TIMEZONE),
                     "",
+                    "blocked slot",
                 ))
             except (KeyError, ValueError):
                 continue
 
-    def preceding_event(slot_start: datetime) -> tuple[datetime, str]:
-        """Return the end time and location of the event immediately before slot_start."""
+    def preceding_event(slot_start: datetime) -> tuple[datetime, str, str]:
+        """Return the end time, location, and name of the event immediately before slot_start."""
         preceding = [e for e in busy if e[1] <= slot_start]
         if not preceding:
-            return slot_start, RENTER_HOME_LOCATION
+            return slot_start, RENTER_HOME_LOCATION, "home"
         latest = max(preceding, key=lambda e: e[1])
-        return latest[1], latest[2] or RENTER_HOME_LOCATION
+        return latest[1], latest[2] or RENTER_HOME_LOCATION, latest[3]
 
-    def following_event(slot_end: datetime) -> tuple[datetime, str] | None:
-        """Return the start time and location of the event immediately after slot_end."""
+    def following_event(slot_end: datetime) -> tuple[datetime, str, str] | None:
+        """Return the start time, location, and name of the event immediately after slot_end."""
         following = [e for e in busy if e[0] >= slot_end]
         if not following:
             return None
         earliest = min(following, key=lambda e: e[0])
-        return earliest[0], earliest[2] or RENTER_HOME_LOCATION
+        return earliest[0], earliest[2] or RENTER_HOME_LOCATION, earliest[3]
 
     property_address = load_property_address()
     if not property_address:
@@ -385,46 +388,54 @@ def get_free_slots() -> str:
 
             is_free = all(
                 slot_end <= b_start or slot_start >= b_end
-                for b_start, b_end, _ in busy
+                for b_start, b_end, *_ in busy
             )
 
             if not is_free:
-                app.logger.info(f"Slot {slot_label} | BUSY (calendar clash)")
+                clashing = [e for e in busy if not (slot_end <= e[0] or slot_start >= e[1])]
+                clash_names = ", ".join(e[3] for e in clashing) or "unknown"
+                app.logger.info(f"Slot {slot_label} | BUSY — clashes with: {clash_names}")
                 slot_start = slot_end
                 continue
 
             if property_address:
                 # Inbound: can renter arrive from preceding event in time?
-                event_end_time, origin = preceding_event(slot_start)
+                event_end_time, origin, prev_name = preceding_event(slot_start)
                 inbound_minutes = get_commute_minutes(origin, property_address, event_end_time)
-                latest_departure = event_end_time + timedelta(minutes=inbound_minutes)
+                latest_arrival = event_end_time + timedelta(minutes=inbound_minutes)
                 app.logger.info(
-                    f"Slot {slot_label} | inbound: origin={origin!r} departs={event_end_time.strftime('%-I:%M %p')} "
-                    f"commute={inbound_minutes}m arrives={latest_departure.strftime('%-I:%M %p')} "
-                    f"slot_start={slot_start.strftime('%-I:%M %p')}"
+                    f"Slot {slot_label} | inbound: prev_event={prev_name!r} origin={origin!r} "
+                    f"ends={event_end_time.strftime('%-I:%M %p')} commute={inbound_minutes}m "
+                    f"arrives={latest_arrival.strftime('%-I:%M %p')} need_by={slot_start.strftime('%-I:%M %p')}"
                 )
-                if latest_departure > slot_start:
-                    app.logger.info(f"Slot {slot_label} | REJECTED — inbound commute clash ({inbound_minutes} mins, arrives too late)")
+                if latest_arrival > slot_start:
+                    app.logger.info(
+                        f"Slot {slot_label} | REJECTED — inbound clash: {inbound_minutes}m from {prev_name!r} "
+                        f"({origin!r}) arrives {latest_arrival.strftime('%-I:%M %p')}, slot starts {slot_start.strftime('%-I:%M %p')}"
+                    )
                     slot_start = slot_end
                     continue
 
                 # Outbound: can renter reach the next event from the viewing in time?
                 next_ev = following_event(slot_end)
                 if next_ev:
-                    next_start, next_location = next_ev
+                    next_start, next_location, next_name = next_ev
                     outbound_minutes = get_commute_minutes(property_address, next_location, slot_end)
                     earliest_arrival = slot_end + timedelta(minutes=outbound_minutes)
                     app.logger.info(
-                        f"Slot {slot_label} | outbound: dest={next_location!r} departs={slot_end.strftime('%-I:%M %p')} "
-                        f"commute={outbound_minutes}m arrives={earliest_arrival.strftime('%-I:%M %p')} "
-                        f"next_event={next_start.strftime('%-I:%M %p')}"
+                        f"Slot {slot_label} | outbound: next_event={next_name!r} dest={next_location!r} "
+                        f"departs={slot_end.strftime('%-I:%M %p')} commute={outbound_minutes}m "
+                        f"arrives={earliest_arrival.strftime('%-I:%M %p')} need_by={next_start.strftime('%-I:%M %p')}"
                     )
                     if earliest_arrival > next_start:
-                        app.logger.info(f"Slot {slot_label} | REJECTED — outbound commute clash ({outbound_minutes} mins, can't reach next event)")
+                        app.logger.info(
+                            f"Slot {slot_label} | REJECTED — outbound clash: {outbound_minutes}m to {next_name!r} "
+                            f"({next_location!r}) arrives {earliest_arrival.strftime('%-I:%M %p')}, event starts {next_start.strftime('%-I:%M %p')}"
+                        )
                         slot_start = slot_end
                         continue
                 else:
-                    app.logger.info(f"Slot {slot_label} | outbound: no following event — outbound check skipped")
+                    app.logger.info(f"Slot {slot_label} | outbound: no following event — skipped")
 
             app.logger.info(f"Slot {slot_label} | AVAILABLE")
             free_slots.append(
@@ -621,6 +632,7 @@ Rules:
 - Max 20 words per reply. Casual, warm, human tone. No paragraphs, no bullet lists.
 - No emojis. Minimal punctuation. No commas unless absolutely necessary. Exclamation marks only occasionally at the end of a sentence.
 - Never say "we". Always use first name only: {renter_first}. Say "{renter_first} is free at..." not "we have availability". Never use the full name.
+- Never list all available slots. Pick 2 or 3 of the soonest viable options and suggest them naturally in conversation.
 - Only propose times from the available slots below. If the landlord suggests another time, call check_slot_availability first — if it's free confirm it, if not suggest the nearest free slot returned by the tool.
 - When proposing or confirming any time always state the exact start and end time in the format "Xpm to Ypm" e.g. "6:30pm to 7:00pm". Never mention just a start time without the end time.
 - If the landlord asks for any documents, call send_documents with the relevant names from: payslip, right_to_rent, passport. For broad requests like "all docs" or "everything" send all three. After sending, reply confirming which were sent.
