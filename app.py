@@ -173,15 +173,15 @@ def send_documents(doc_names: list[str], to: str) -> str:
 
 def send_intro_messages(to: str) -> None:
     """Send five ordered intro texts before any other message."""
-    name  = os.environ.get("RENTER_NAME", "the renter")
+    first = os.environ.get("RENTER_NAME", "the renter").split()[0]
     area  = os.environ.get("RENTER_AREA", "")
     phone = os.environ.get("RENTER_PHONE", "")
     messages = [
         "Hi I'm an AI assistant from Tenably helping landlords and renters arrange viewings",
-        f"I'm reaching out on behalf of {name}",
-        f"{name} currently lives in {area} and is interested in your property",
+        f"I'm reaching out on behalf of {first}",
+        f"{first} currently lives in {area} and is interested in your property",
         f"If you'd prefer to speak directly you can call or text them at {phone}",
-        f"I already have {name}'s payslip right to rent and passport — just ask if you'd like any of them",
+        f"I already have {first}'s payslip right to rent and passport — just ask if you'd like any of them",
     ]
     for i, msg in enumerate(messages):
         if i > 0:
