@@ -2,6 +2,8 @@ import os
 import re
 import json
 import uuid
+import logging
+import sys
 import time as time_module
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, time
@@ -18,6 +20,10 @@ from googleapiclient.discovery import build
 load_dotenv()
 
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
+if not app.logger.handlers:
+    app.logger.addHandler(logging.StreamHandler(sys.stdout))
+
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 twilio_client = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
 
