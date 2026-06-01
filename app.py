@@ -130,11 +130,28 @@ def load_preferences() -> dict:
 
 
 def load_property_address() -> str:
-    try:
-        with open("property.json") as f:
-            return json.load(f).get("address", "")
-    except (FileNotFoundError, json.JSONDecodeError):
-        return VIEWING_PROPERTY_ADDRESS
+    import os.path
+    if os.path.exists("property.json"):
+        try:
+            with open("property.json") as f:
+                raw = f.read()
+            app.logger.info(f"load_property_address: property.json contents: {raw!r}")
+            address = json.loads(raw).get("address", "")
+            if address:
+                app.logger.info(f"load_property_address: using address from property.json: {address!r}")
+                return address
+            app.logger.warning("load_property_address: property.json exists but 'address' key is missing or empty")
+        except json.JSONDecodeError as e:
+            app.logger.warning(f"load_property_address: failed to parse property.json: {e}")
+    else:
+        app.logger.warning("load_property_address: property.json not found on disk")
+
+    fallback = os.environ.get("PROPERTY_ADDRESS") or VIEWING_PROPERTY_ADDRESS
+    if fallback:
+        app.logger.info(f"load_property_address: using fallback address: {fallback!r}")
+    else:
+        app.logger.warning("load_property_address: no property address available — set PROPERTY_ADDRESS env var")
+    return fallback
 
 
 def send_documents(doc_names: list[str], to: str) -> str:
@@ -593,6 +610,7 @@ def create_viewing_event(start_iso: str, end_iso: str, landlord_phone: str) -> s
 def build_system_prompt() -> str:
     available_slots = get_free_slots()
     now_str = datetime.now(tz=TIMEZONE).strftime("%A %-d %B %Y, %-I:%M %p %Z")
+    renter_first = RENTER_NAME.split()[0]
     return f"""You are a WhatsApp assistant for Tenably arranging a property viewing on behalf of {RENTER_NAME}.
 
 Current date and time: {now_str}
@@ -601,7 +619,7 @@ Rules:
 - Write in British English at all times.
 - Max 20 words per reply. Casual, warm, human tone. No paragraphs, no bullet lists.
 - No emojis. Minimal punctuation. No commas unless absolutely necessary. Exclamation marks only occasionally at the end of a sentence.
-- Never say "we". Always refer to the renter by name. Say "{RENTER_NAME} is free at..." not "we have availability".
+- Never say "we". Refer to the renter by first name only: {renter_first}. Say "{renter_first} is free at..." not "we have availability". Only use the full name {RENTER_NAME} when first introducing them.
 - Only propose times from the available slots below. If the landlord suggests another time, call check_slot_availability first — if it's free confirm it, if not suggest the nearest free slot returned by the tool.
 - When proposing or confirming any time always state the exact start and end time in the format "Xpm to Ypm" e.g. "6:30pm to 7:00pm". Never mention just a start time without the end time.
 - If the landlord asks for any documents, call send_documents with the relevant names from: payslip, right_to_rent, passport. For broad requests like "all docs" or "everything" send all three. After sending, reply confirming which were sent.
